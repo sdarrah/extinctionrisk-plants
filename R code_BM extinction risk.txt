@@ -1,0 +1,189 @@
+##################################################################################################
+### RANDOM FOREST MODEL FOR PREDICTING EXTINCTION RISK IN NON ASSESSED BULBOUS MONOCOT SPECIES ###
+##################################################################################################
+
+#install packages
+install.packages("caret")
+install.packages("ROCR")
+install.packages("kernlab")
+install.packages("e1071")
+install.packages("rpart")
+install.packages("caTools")
+install.packages("spdep")
+install.packages("ncf")
+install.packages("gbm")
+install.packages("pROC")
+install.packages("randomForest")
+install.packages("rpart.plot")
+install.packages("ellipse")
+
+#Open libraries
+library(caret)
+library(ROCR)
+library(kernlab)
+library (e1071)
+library(rpart)
+library(caTools)
+library(spdep)
+library(ncf)
+library(gbm)
+library(pROC)
+library(randomForest)
+library(rpart.plot)
+library(ellipse)
+
+#Open data
+setwd("insertpath") # insert correct path name
+BM<-read.csv("insertpath") # insert correct path name
+dim(BM) # check dataset
+names(BM)
+#summary(BM)
+
+row.names(BM)<- BM$Genus_species
+
+# Test log transformation of all variables for scale on partial dependence plots later on
+BM$Range<- log(BM$Range)
+BM$Human.Footprint.Index<- log(BM$HFI+1)
+BM$ForestLoss<- log(BM$ForestLoss+1)
+BM$AreaProtected<- log(BM$AreaProtected+1)
+BM$Population<- log(BM$Population+1)
+
+# Separate assessed species
+assessed<- data.frame(subset(BM, RL_status!="nonassessed"))
+row.names(assessed)<- assessed$Genus_species
+RL_status<-assessed$RL_status
+assessed$binary<- factor((assessed$RL_status=="VU")+(assessed$RL_status=="EN")+(assessed$RL_status=="CR"))
+levels(assessed$binary)[levels(assessed$binary)=="0"]<- "nonThr"
+levels(assessed$binary)[levels(assessed$binary)=="1"]<- "Thr"
+binary<- assessed$binary # define classes
+
+assessed<- subset(assessed, select= -c(Genus_species,RL_status, binary, Genus))
+
+# Setting nonassessed species aside
+nonassessedspecies<- data.frame(subset (BM, RL_status=="nonassessed"))
+row.names(nonassessedspecies)<- nonassessedspecies$Genus_species
+nonassessedspecies<- subset(nonassessedspecies,select= -c(Genus_species,RL_status, Genus))
+
+#######################################################################################################################
+#########################  Random Forests Model for IUCN Red Listed and SRLI Species  #################################
+
+# No partitioning #
+trainassessed<- assessed
+trainB<- binary
+
+# Control Parameters #
+control.params<- trainControl(summaryFunction= twoClassSummary, selectionFunction= "best", 
+                              method="repeatedcv", number=10, repeats=5, 
+                              returnData=T,returnResamp="final",classProbs=TRUE)
+
+# The Model #
+rf.model<- train(trainnonassessed,trainB,method="rf", metric="ROC",tuneLength= ncol(assessed), 
+                 trControl= control.params, ntrees = 500) # 500 trees works better than 100, or 1,000 trees
+print(rf.model)
+
+#######################################################################################################################
+##################################  Interpreting probabilistic results  ###############################################
+
+results.rf<-predict(rf.model$finalModel,trainnonassessed,type="prob")[,2]
+#print(results.rf)
+
+binary2<- as.vector(binary)
+RL_status<-as.character(RL_status)
+dataframe<- data.frame(cbind(results.rf,RL_status, binary2))
+write.csv(dataframe, file="insertpath") # insert correct path name to save results as .csv
+
+results.rf<- as.vector(results.rf)
+dataframe<- data.frame(cbind(results.rf,binary2))
+dataframe$results.rf<- as.numeric(as.character(dataframe$results.rf)) # as numeric changes the variable value. needs correction
+par(mfrow=c(2,2))
+hist(dataframe$results.rf, xlab="Probability of extinction", main=NULL, cex.main=1, ylim=c(0,50))
+abline(v=0.42,col=3,lty=3) # set abline as correct probability threshold from results
+hist(dataframe$results.rf[dataframe$binary2=="nonThr"], xlab="Probability of extinction", main=NULL, cex.main=1, ylim=c(0,50), xlim=c(0,1))
+abline(v=0.42,col=3,lty=3)
+hist(dataframe$results.rf[dataframe$binary2=="Thr"], xlab="Probability of extinction", main=NULL, cex.main=1, xlim=c(0,1))
+abline(v=0.42,col=3,lty=3)
+
+preds<- prediction(predictions=results.rf, labels=trainB) #  indicate which model results, e.g. results.rf
+print(preds)
+
+# AUC
+AUC<- performance(preds, "auc")
+AUC
+myROC<- performance(preds, "tpr", "fpr")
+myROCtable<- data.frame(cbind(myROC@alpha.values[[1]],myROC@y.values[[1]],myROC@x.values[[1]])) # creating dataframe with cutoff, tpr, fpr
+# Youden's Index
+myROCtable$X4<- myROCtable$X2 - myROCtable$X3
+cutoff<- myROCtable$X1[which.max(myROCtable$X4)]
+cutoff
+Youden<- myROCtable$X4[which.max(myROCtable$X4)]
+Youden
+# ROC plot
+par(mfrow=c(1,1))
+plot(myROC, main=NULL, colorize=T, ylim= c(0,1))
+# Confusion matrix
+score<- ifelse(results.rf<=cutoff,"nonThr", "Thr")
+confusion<- confusionMatrix(score,trainB, positive="Thr")
+confusion
+
+
+
+#######################################################################################################################
+############################ Comparing probabilities with IUCN Red List status ########################################
+
+results<- results.rf
+print(results)
+
+pred.names<- as.vector(row.names(trainnonassessed))
+assessed2<- data.frame(subset(BM, RL_status!="nonassessed"))
+row.names(assessed2)<- assessed2$Genus_species
+pred.frame<- assessed2[match(pred.names,assessed2$Genus_species),] # selecting rows for which we have predicted status
+pred.frame$RL_status<- droplevels(pred.frame$RL_status) # drop unused levels
+pred.frame<- cbind(pred.frame[,1:2], results)
+pred.frame$RL_status <- factor(pred.frame$RL_status, levels = c("LC", "NT", "VU", "EN", "CR"), labels = c("LC", "NT", "VU", "EN", "CR")) 
+plot(pred.frame$RL_status,pred.frame$results, xlab= "Red List category", cex.lab=0.9,
+     ylab= "Predicted probability of threat",
+     main=NULL, cex.main=0.9)
+box<- boxplot(results~RL_status, labels=row.names(pred.frame),data=pred.frame, id.n=10)
+identify(pred.frame$RedList,pred.frame$results.rf,pred.frame$Binomial,pos=F,plot=T)
+write.table(pred.order,"insertpath") # insert correct path name to save table
+
+
+
+#######################################################################################################################
+############################################ Variable Importance ######################################################
+
+random.forest<-randomForest(trainonassessed,trainB,ntreeTry=500, # changed to 500
+                            mtry= rf.model$bestTune[1,1],replace=T,importance=TRUE)
+rf.importance<- importance(random.forest, type=2)
+rf.importance
+rf.importance<- data.frame(rf.importance)
+rf.importance$names<- row.names(rf.importance)
+rf.importance<- rf.importance[order(rf.importance$MeanDecreaseGini, decreasing=FALSE),]
+rf.importance
+
+dotchart(rf.importance$MeanDecreaseGini, labels = row.names(rf.importance), xlab= "Mean Decrease in Gini Index", main="Variable importance in random forest model")
+
+#Partial depence plots
+par(mfrow=c(3,2))
+partialPlot(random.forest,trainnonassessed, x.var= "Range", n.pt=10, which.class= "Thr", main=NULL, ylab="Partial dependence", xlab="log(Range)", cex.main=1) # n.pt smoothes the graph - number of datapoints from which the function is computed
+partialPlot(random.forest,trainnonassessed, x.var= "Isolation", n.pt=10, which.class= "Thr", main=NULL, ylab="Partial dependence", xlab="Isolation index", cex.main=1) 
+partialPlot(random.forest,trainnonassessed, x.var= "Human.Footprint.Index", n.pt=10, which.class= "Thr", main=NULL, ylab="Partial dependence", xlab="log(Human Footprint Index)", cex.main=1) # n.pt smoothes the graph - number of datapoints from which the function is computed
+partialPlot(random.forest,trainnonassessed, x.var= "ForestLoss", n.pt=10, which.class= "Thr", main=NULL, ylab="Partial dependence", xlab="log(Forest loss)", cex.main=1) 
+partialPlot(random.forest,trainnonassessed, x.var= "Population", n.pt=10, which.class= "Thr", main=NULL, ylab="Partial dependence", xlab="log(Population density)" ,cex.main=1)
+partialPlot(random.forest,trainnonassessed, x.var= "AreaProtected", n.pt=10, which.class= "Thr", main=NULL, ylab="Partial dependence", xlab="log(Percentage prea protected)", cex.main=1)
+
+# getTree(random.forest,k=1) - but can only see split for individual trees, no average.
+
+################################################################################################################################
+####################################### Predicting the status of nonassessed species ###########################################
+
+resultsnonassessed<- predict(rf.model$finalModel, nonassessedspecies, type="prob")
+resultsnonassessed<- resultsnonassessed[,2]
+#print(resultsnonassessed)
+scorenonassessed<- ifelse(resultsnonassessed<=cutoff,"nonThr", "Thr")
+scorenonassessed<- as.character(scorenonassessed)
+resultsnonassessed<-cbind(resultsnonassessed, scorenonassessed)
+scorenonassessed<-as.factor(scorenonassessed)
+summary(scorenonassessed)
+
+write.csv(resultsnonassessed, file="insertpath") #insert correct path name to save prediction results for non assessed species
